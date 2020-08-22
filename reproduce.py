@@ -36,7 +36,7 @@ class SparseResNet(nn.Module):
             scn.SparseToDense(3, 256))
         self.avgpool = nn.AdaptiveAvgPool3d((1, 1, 1))
         # self.spatial_size= self.sparseModel.input_spatial_size(torch.LongTensor([1, 1]))
-        self.spatial_size = torch.LongTensor([101, 101])
+        self.spatial_size = torch.LongTensor([101, 101, 101])
         self.inputLayer = scn.InputLayer(3,self.spatial_size, mode=3)
 
     def forward(self, x):
