@@ -1,198 +1,158 @@
 import torch
-import numpy as numpy
+import numpy as np
 import torch.optim as optim
 import random
 import torch.nn as nn
-import yaml
-import pickle
 import argparse
 import time
+import h5py
 import datetime
-import os, sys
-import shutil, json
+import os, sys, pdb
 
 from torch.utils.data import Dataset, DataLoader
-from torch.utils.tensorboard import SummaryWriter
-# from Architectures.CNN import *
-# from Architectures.ResNet_3D import *
-# from Architectures.SiameseLike_ResNet_oneChannel import *
-from Architectures.SparseResNet_3D import *
-from DataLoader.DuneNuMuCCDataset_3D import *
-# from DataLoader.DuneNuMuCCDataset_oneChannel import *
-from Architectures.LossFunctions import *
-from lib.listdirFullPath import *
-from lib.sortFullPath import *
+import sparseconvnet as scn
 
-import pdb
-
-DATA_DIR = '/mnt/sda/dune/data/preprocessed_3D_data'
-# DATA_DIR = '/baldig/physicstest/dune/preprocessed_3D_data/'
-# DATA_DIR = '/baldig/physicsprojects2/dune/data/cropped_new/'
-OUT_DIR = './Results'
-SHUFFLE = True
 batch_size = 32
 epochs = 100
-
-# Read arguments and setup device
-parser = argparse.ArgumentParser(description='PyTorch DUNE Direction Regression')
-parser.add_argument('--sparse', action='store_true', default=False,
-                    help='using submanifold sparse convolutional layers')
-parser.add_argument('--name', type=str, default='')
-parser.add_argument('--prong', action='store_true', default=False,
-                    help='whether train on full-event or prong-only images')
-parser.add_argument('--l2', action='store_true', default=False,
-                    help='whether add l2 regularization for all params to loss')
-parser.add_argument('--uncropped', action='store_true', default=False,
-                    help='train on uncropped 100x100x100 data')
-parser.add_argument('--type', type=str, default='numucc', choices=['numucc', 'nuecc'])
-args = parser.parse_args()
-
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using: {}".format(device))
 
-# Creating results/logs saving folder
-saving_dir = os.path.join(OUT_DIR, args.name+'_'+str(datetime.datetime.now().strftime("%Y%m%d-%H%M%S")))
-if not os.path.isdir(saving_dir):
-    os.makedirs(saving_dir)
-else:
-    print("Folder already exists! Check folder name please!")
-    sys.exit()
+class SparseResNet(nn.Module):
+    def __init__(self):
+        nn.Module.__init__(self)
+        self.sparseModel = scn.Sequential(
+            scn.SubmanifoldConvolution(3, 1, 64, 7, False),  # sscn(dimension, nIn, nOut, filter_size, bias)
+            scn.BatchNormReLU(64),
+            scn.MaxPooling(3, 3, 2),  # MaxPooling(dimension, pool_size, pool_stride)
+            scn.SparseResNet(3, 64, [  # SpraseResNet(dimension, nInputPlanes, layers=[])
+                        ['b', 64, 2, 1],  # [block_type, nOut, rep, stride]
+                        ['b', 64, 2, 1],
+                        ['b', 128, 2, 2],
+                        ['b', 128, 2, 2],
+                        ['b', 256, 2, 2],
+                        ['b', 256, 2, 2],
+                        ['b', 512, 2, 2],
+                        ['b', 512, 2, 2]]),
+            scn.SparseToDense(3, 256))
+        self.avgpool = nn.AdaptiveAvgPool3d((1, 1, 1))
+        # self.spatial_size= self.sparseModel.input_spatial_size(torch.LongTensor([1, 1]))
+        self.spatial_size = torch.LongTensor([101, 101])
+        self.inputLayer = scn.InputLayer(3,self.spatial_size, mode=3)
 
-# Save configurations
-shutil.copyfile('train_oneChannel.py', os.path.join(saving_dir, 'train_oneChannel.py'))
-# shutil.copyfile('Architectures/ResNet_3D.py', os.path.join(saving_dir, 'ResNet_3D.py'))
-shutil.copyfile('Architectures/SparseResNet_3D.py', os.path.join(saving_dir, 'SparseResNet_3D.py'))
-with open(os.path.join(saving_dir, 'cofig_args.txt'), 'w') as f:
-    json.dump(args.__dict__, f, indent=2)
+    def forward(self, x):
+        pdb.set_trace()
+        x = self.inputLayer(x)
+        x = self.sparseModel(x)
+        x = self.avgpool(x)
+        # x = x.view(-1, 64)
+        x = torch.flatten(x, 1)
+        return x
+
+class Net(nn.Module):
+    def __init__(self):
+        super(Net, self).__init__()
+        self.ResNet = SparseResNet()
+
+        self.fc = nn.Linear(512 * 1, 4096)
+        self.relu = nn.ReLU(inplace=True)
+        self.linear = nn.Linear(4096, 3)
+
+    def forward(self, x):
+        top = self.ResNet(x)
+        top = self.fc(top)
+        top = self.relu(top)
+        out = self.linear(top)
+
+        return out
+
+
+class DuneNuMuCCDataset(Dataset):
+    """Dune NuMuCC dataset. """
+
+    def __init__(self, transform=None, nu_type='nuecc'):
+        """
+        Args:
+            file_list (list of string): list of names of the data files.
+            root_dir (string): Directory with all the data (images+targets).
+            transform (callable, optional): Optional transform to be applied
+                on a sample.
+        """
+        self.image_path = '/mnt/sda/dune/preprocessed_3D_data/{}/3D_images/0.h5'.format(nu_type)
+        self.target_path = '/mnt/sda/dune/preprocessed_3D_data/{}/prong_direction/0.h5'.format(nu_type)
+        self.reco_path = '/mnt/sda/dune/preprocessed_3D_data/{}/prong_reco_direction/0.h5'.format(nu_type)
+        self.data = {}
+        # with h5py.File(self.image_path, 'r') as f_image, \
+        #         h5py.File(self.target_path, 'r') as f_target, \
+        #         h5py.File(self.reco_path, 'r') as f_reco:
+        #     images = f_image['data'][...]
+        #     targets = f_target['data'][...]
+        #     recos = f_reco['data'][...]
+        images = np.zeros([483, 1, 100, 100, 100])
+        targets = np.ones([483, 3])
+        recos = np.ones([483, 3])
+        self.data['image'] = images
+        self.data['target'] = targets
+        self.data['reco'] = recos
+        # DATA_DIR = '/baldig/physicstest/dune/preprocessed_3D_data/'
+    
+    def __len__(self):
+        return len(self.data['target'])
+
+    def __getitem__(self, index):
+        # check nan
+        if np.isnan(self.data['target'][index]).sum() > 0:
+            # pdb.set_trace()
+            # img = self.data['image'][index]
+            pass
+        
+        return_data = {
+            'image': self.data['image'][index], \
+            'target': self.data['target'][index], \
+            'reco': self.data['reco'][index] \
+                        }
+
+        return return_data
+
 
 # Define my_collate for sparse training
-if args.sparse:
-    def my_collate(batch):
-        """Process the batch to fit into submanifold sparse format"""
-        msgs = [item['image'] for item in batch]
-        target = [item['target'] for item in batch]
+def my_collate(batch):
+    """Process the batch to fit into submanifold sparse format"""
+    msgs = [item['image'] for item in batch]
+    target = [item['target'] for item in batch]
 
-        locations = []  # Only one channel/view
-        features = []
-        for batchIdx, msg in enumerate(msgs):
-            for y in range(msg.shape[1]):
-                for x in range(msg.shape[2]):
-                    for z in range(msg.shape[3]):
-                        if msg[0, x, y, z] != 0.0:
-                            locations.append([z, y, x, batchIdx])
-                            features.append([1])
-        locations = torch.LongTensor(locations)
-        features = torch.FloatTensor(features)
-
-
-        target = torch.FloatTensor(target)
-
-        return_data = {
-            'image': [locations, features], \
-            'target': target}
-        return return_data
-else:
-    my_collate = None
+    locations = []  # Only one channel/view
+    features = []
+    for batchIdx, msg in enumerate(msgs):
+        for y in range(msg.shape[1]):
+            for x in range(msg.shape[2]):
+                for z in range(msg.shape[3]):
+                    if msg[0, x, y, z] != 0.0:
+                        locations.append([z, y, x, batchIdx])
+                        features.append([1])
+    locations = torch.LongTensor(locations)
+    features = torch.FloatTensor(features)
 
 
-# Read file indices
-with open('split_paths.pkl', 'rb') as f:
-    fileIdx_dict = pickle.load(f)
-train_fileIdx_list = fileIdx_dict['train']
-val_fileIdx_list = fileIdx_dict['test']  # dict['valid'] is empty
+    target = torch.FloatTensor(target)
 
-train_dataset = DuneNuMuCCDataset(
-                    train_fileIdx_list,
-                    os.path.join(DATA_DIR, args.type), 
-                    prong=args.prong,
-                    transform=None,
-                    uncropped=args.uncropped,
-                    nu_type=args.type)
-val_dataset = DuneNuMuCCDataset(
-                    val_fileIdx_list,
-                    os.path.join(DATA_DIR, args.type),
-                    prong=args.prong,
-                    transform=None,
-                    uncropped=args.uncropped,
-                    nu_type=args.type)
+    return_data = {
+        'image': [locations, features], \
+        'target': target}
+    return return_data
 
+# Initialize dataset
+train_dataset = DuneNuMuCCDataset()
 # Initialize data loaders
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, collate_fn=my_collate)# , num_workers=4)
 train_size = train_dataset.__len__()
 print("For training process, we have {} events".format(train_size))
-val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=my_collate)# , num_workers=4)
-val_size = val_dataset.__len__()
-print("For validation process, we have {} events".format(val_size))
-train_num_batches = train_dataset.__len__() // batch_size
-print("Total training batches: {}".format(train_num_batches))
+
 
 # Initialize model and optimizers
 net = Net().to(device)
-meanAngleDiff = meanAngleDiff()
+criterion = nn.MSELoss()
 optimizer = optim.Adam(net.parameters(), lr=0.01)# , momentum=0.9)
 scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.8, patience=5, verbose=True)
-
-def val_test(model, optimizer, data_loader, how_far, epoch, lowest_loss, date, phase='valid'):
-    """Do validation/test at the end of epochs
-    Phase='valid': after each several batches,
-    Phase='test': at the end of each epoch (no tensorboard recording)
-    """
-    cos_loss = 0.0
-    angle_diff = 0.0
-    batch_counter = 0.0
-    
-    with torch.no_grad():
-        for _, batch in enumerate(data_loader):
-            inputs = batch['image']
-            inputs = inputs.cuda()
-            targets = batch['target'].cuda()
-
-            outputs = model(inputs)
-            loss = meanAngleDiff.angle_loss_strict(targets, outputs)
-            cos_loss += loss.item()
-            angle_diff += meanAngleDiff.mean_angle_diff(targets, outputs).item()
-            batch_counter += 1
-        
-        if phase == 'valid':
-            writer.add_scalar('Loss/validation loss',
-                                cos_loss / batch_counter,
-                                how_far)
-            writer.add_scalar('AngleDiff/validation angle difference',
-                                angle_diff / batch_counter,
-                                how_far)
-        history['{}_loss'.format(phase)].append((how_far, cos_loss / batch_counter))
-        history['{}_angle_diff'.format(phase)].append((how_far, angle_diff / batch_counter))
-        
-        print('During the %s process, cos_distance: %.3f angle_diff: %.3f' %
-                  (phase, cos_loss / batch_counter, angle_diff / batch_counter))
-
-    # Save the best model
-    if cos_loss / batch_counter <= lowest_loss:
-        lowest_loss = cos_loss / batch_counter
-        # torch.save(model, os.path.join(model_dir, '{}_{}.pt'.format(args.name, date)))
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'loss': lowest_loss,
-            }, os.path.join(model_dir, '{}_{}.ptDict'.format(args.name, date)))
-    else: pass
-
-    return lowest_loss
-
-
-# Set up recorder
-log_dir = os.path.join(saving_dir, 'logs'); os.makedirs(log_dir)
-model_dir = os.path.join(saving_dir, 'models'); os.makedirs(model_dir)
-tensorboard_dir = os.path.join(saving_dir, 'tensorboards'); os.makedirs(tensorboard_dir)
-writer = SummaryWriter(os.path.join(tensorboard_dir, '{}_{}'.format(args.name, str(datetime.datetime.now().strftime("%Y%m%d-%H%M%S")))))
-yaml_f = open(os.path.join(log_dir, '{}_training_recorder_{}.yaml'.format(args.name, str(datetime.datetime.now().strftime("%Y%m%d-%H%M%S")))), 'w')
-history = {'train_loss': [], 'train_angle_diff': [], \
-            'valid_loss': [], 'valid_angle_diff': [], \
-            'test_loss': [], 'test_angle_diff': []
-          }
-lowest_loss = float("inf")
-start_training_date = str(datetime.datetime.now().strftime("%Y%m%d"))
 
 # Start training
 for epoch in range(epochs):
@@ -203,75 +163,30 @@ for epoch in range(epochs):
         epoch_time_end = time.time()
     epoch_time_start = time.time()
         
-    running_loss1 = 0.0
-    running_loss2 = 0.0
-
+    running_loss = 0.0
+    counter = 0.0
     for i_batch, sample_batched in enumerate(train_loader):
 
         inputs = sample_batched['image']
-        if args.sparse:
-            inputs = [inputs[0].to(device), inputs[1].to(device)]
-        else:
-            inputs = inputs.to(device)
+        inputs = [inputs[0].to(device), inputs[1].to(device)]
         targets = sample_batched['target'].to(device)
 
         optimizer.zero_grad()
 
         outputs = net(inputs)
-        loss = meanAngleDiff.angle_loss_strict(targets, outputs)
-        if args.l2:
-            reg_lambda = 0.01
-            l2_reg = 0
-            for W in net.parameters():
-                l2_reg += W.norm(2)
-            loss += reg_lambda * l2_reg
+        loss = criterion(targets, outputs)
+
         loss.backward()
         optimizer.step()
 
         optimizer.zero_grad()
 
-        running_loss1 += loss.item()
-        running_loss2 += meanAngleDiff.mean_angle_diff(targets, outputs).item() # loss.item()
+        running_loss += loss.item()
+        counter += 1.0
 
-        report_interval = train_num_batches // 50
-        if i_batch % report_interval == 0 and i_batch != 0:  # every <report_interval> mini-batches
-
-            writer.add_scalar('Loss/training loss',
-                            running_loss1 / report_interval,
-                            epoch * len(train_loader) + i_batch)
-            writer.add_scalar('AngleDiff/training angle difference',
-                            running_loss2 / report_interval,
-                            epoch * len(train_loader) + i_batch)
-            history['train_loss'].append((epoch * len(train_loader) + i_batch, \
-                                            running_loss1 / report_interval))
-            history['train_angle_diff'].append((epoch * len(train_loader) + i_batch, \
-                                            running_loss2 / report_interval))
-            print('[%d, %5d/%5d] cos_distance: %.3f angle_diff: %.3f per_epoch_time: %.2fsec' \
-                    % (epoch + 1, i_batch + 1, train_num_batches, \
-                    running_loss1 / report_interval, running_loss2 / report_interval, \
-                    epoch_time_end - epoch_time_start_prev))
-            running_loss1 = 0.0
-            running_loss2 = 0.0
-            if i_batch % (report_interval * 10) == 0:  # validate after each 1000 mini-batches
-                lowest_loss = val_test(net, optimizer, val_loader, \
-                                epoch*len(train_loader)+i_batch, epoch, \
-                                lowest_loss, start_training_date, phase='valid')
-    
-    # Test at the end of each epoch
-    lowest_loss = val_test(net, optimizer, val_loader, \
-                    epoch, epoch, \
-                    lowest_loss, start_training_date, phase='test')
-    # Save intermediate logs
-    yaml.dump(history, yaml_f)
+    print("Loss: {}".format(running_loss / counter))
 
     scheduler.step(loss)
-        
-
-# Save training process and trained model
-data = yaml.dump(history, yaml_f)
-yaml_f.close()
-torch.save(net, os.path.join(model_dir, '{}_{}_final.pt'.format(args.name, str(datetime.datetime.now().strftime("%Y%m%d-%H%M%S")))))
-writer.close()
 
 print('Finished Training')
 
